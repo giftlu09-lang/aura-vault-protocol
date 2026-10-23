@@ -40,6 +40,7 @@ data:
 
     ruler:
       enable_api: true
+      enable_alertmanager_v2: true
       alertmanager_url: http://alertmanager:9093
       rule_path: /tmp/loki/rules-temp
       storage:

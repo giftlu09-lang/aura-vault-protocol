@@ -1,266 +1,132 @@
-name: Infrastructure Drift Detection
+name: Terraform drift detection
 
 on:
   schedule:
-    # Daily at 06:00 UTC
-    - cron: '0 6 * * *'
+    - cron: "0 6 * * *"
   workflow_dispatch:
-    inputs:
-      auto_remediate:
-        description: 'Auto-remediate safe drift (tag changes only)'
-        type: boolean
-        default: true
+
+permissions:
+  contents: read
+  id-token: write
+  issues: write
 
 concurrency:
-  group: terraform-drift
+  group: terraform-drift-${{ github.ref }}
   cancel-in-progress: false
-
-env:
-  TF_WORKING_DIR: terraform
-  TF_VERSION: '1.5.0'
 
 jobs:
   drift-check:
-    name: Terraform Drift Check
+    name: Check ${{ matrix.environment }} drift
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    permissions:
-      contents: read
-      issues: write
-
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [staging, production]
+    env:
+      TF_DIR: terraform/envs/${{ matrix.environment }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v4
+      - uses: hashicorp/setup-terraform@v4
         with:
-          terraform_version: ${{ env.TF_VERSION }}
+          terraform_version: "1.8.5"
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials through OIDC
         uses: aws-actions/configure-aws-credentials@v6
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ secrets.TF_CI_ROLE_ARN }}
           aws-region: us-east-1
+          role-session-name: drift-${{ matrix.environment }}-${{ github.run_id }}
 
-      - name: Terraform Init
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform init -input=false
+      - name: Initialize Terraform
+        run: terraform -chdir="$TF_DIR" init -input=false
 
-      - name: Terraform Plan (drift detection)
+      - name: Plan refresh-only drift check
         id: plan
-        working-directory: ${{ env.TF_WORKING_DIR }}
         continue-on-error: true
+        shell: bash
         run: |
           set +e
-          terraform plan \
+          terraform -chdir="$TF_DIR" plan \
+            -refresh-only \
             -detailed-exitcode \
             -input=false \
-            -out=tfplan.binary \
-            -var="db_username=${{ secrets.TF_VAR_DB_USERNAME }}" \
-            -var="ssh_public_key=${{ secrets.TF_VAR_SSH_PUBLIC_KEY }}" \
-            2>&1 | tee plan_output.txt
-          EXIT_CODE=${PIPESTATUS[0]}
-          echo "exit_code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
-          echo "Terraform plan exit code: ${EXIT_CODE}"
-          # Exit codes: 0 = no changes, 1 = error, 2 = changes detected
+            -no-color 2>&1 | tee plan-output.txt
+          code=${PIPESTATUS[0]}
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
           exit 0
 
-      - name: Convert plan to JSON
-        if: steps.plan.outputs.exit_code != '1'
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform show -json tfplan.binary > tfplan.json
-
-      - name: Generate drift report
-        id: drift_report
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: |
-          if [ "${{ steps.plan.outputs.exit_code }}" == "2" ]; then
-            echo "=== DRIFT DETECTED ===" >> drift_report.txt
-            echo "Timestamp: $(date -u)" >> drift_report.txt
-            echo "Repository: ${{ github.repository }}" >> drift_report.txt
-            echo "Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> drift_report.txt
-            echo "" >> drift_report.txt
-            echo "=== CHANGED RESOURCES ===" >> drift_report.txt
-            if command -v jq &>/dev/null && [ -f tfplan.json ]; then
-              jq -r '
-                .resource_changes[]
-                | select(.change.actions | map(. != "no-op") | any)
-                | "Resource: " + .address
-                  + "\nActions: " + (.change.actions | join(", "))
-                  + "\nModule: " + (.module_address // "root")
-                  + "\n---"
-              ' tfplan.json >> drift_report.txt 2>/dev/null || echo "Could not parse JSON plan" >> drift_report.txt
-
-              echo "" >> drift_report.txt
-              echo "=== ATTRIBUTE CHANGES ===" >> drift_report.txt
-              jq -r '
-                .resource_changes[]
-                | select(.change.actions | map(. != "no-op") | any)
-                | .address as $addr
-                | (.change.before // {} | to_entries) as $before
-                | (.change.after // {} | to_entries) as $after
-                | ($after - $before | map(select(.key != "tags_all")))
-                | select(length > 0)
-                | "Resource: " + $addr + "\nChanged attributes:"
-                  + (map("\n  - " + .key + ": " + (.value | tostring)) | join(""))
-                  + "\n---"
-              ' tfplan.json >> drift_report.txt 2>/dev/null || true
-            else
-              grep -E '^\s+[~+\-]' plan_output.txt >> drift_report.txt 2>/dev/null || true
-            fi
-            echo "drift_detected=true" >> "$GITHUB_OUTPUT"
-          elif [ "${{ steps.plan.outputs.exit_code }}" == "0" ]; then
-            echo "=== NO DRIFT DETECTED ===" > drift_report.txt
-            echo "Timestamp: $(date -u)" >> drift_report.txt
-            echo "Infrastructure matches Terraform state." >> drift_report.txt
-            echo "drift_detected=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "=== PLAN FAILED ===" > drift_report.txt
-            echo "Terraform plan returned an error. See plan_output.txt for details." >> drift_report.txt
-            echo "drift_detected=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v7
+      - name: Record drift summary
         if: always()
+        run: |
+          case "${{ steps.plan.outputs.exit_code }}" in
+            0) echo "No remote state drift detected for ${{ matrix.environment }}." >> "$GITHUB_STEP_SUMMARY" ;;
+            2) echo "Drift detected for ${{ matrix.environment }}. A labeled issue will be created or updated." >> "$GITHUB_STEP_SUMMARY" ;;
+            *) echo "Terraform plan failed for ${{ matrix.environment }}; inspect the workflow log." >> "$GITHUB_STEP_SUMMARY" ;;
+          esac
+
+      - name: Upload plan output
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
-          name: drift-report-${{ github.run_id }}
+          name: terraform-drift-${{ matrix.environment }}-${{ github.run_id }}
+          path: plan-output.txt
+          if-no-files-found: ignore
           retention-days: 30
-          path: |
-            ${{ env.TF_WORKING_DIR }}/plan_output.txt
-            ${{ env.TF_WORKING_DIR }}/drift_report.txt
-            ${{ env.TF_WORKING_DIR }}/tfplan.json
 
-      - name: Send Slack alert (drift detected)
-        if: steps.plan.outputs.exit_code == '2' && env.SLACK_WEBHOOK_URL != ''
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: |
-          PLAN_SUMMARY=$(head -c 2000 terraform/plan_output.txt | sed 's/"/\\"/g' | tr '\n' ' ')
-          curl -sf -X POST "$SLACK_WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"text\": \":warning: *Infrastructure Drift Detected*\",
-              \"attachments\": [
-                {
-                  \"color\": \"warning\",
-                  \"fields\": [
-                    {\"title\": \"Repository\", \"value\": \"${{ github.repository }}\", \"short\": true},
-                    {\"title\": \"Timestamp\", \"value\": \"$(date -u)\", \"short\": true},
-                    {\"title\": \"Workflow Run\", \"value\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\", \"short\": false},
-                    {\"title\": \"Plan Summary\", \"value\": \"\`\`\`${PLAN_SUMMARY}\`\`\`\", \"short\": false}
-                  ]
-                }
-              ]
-            }" || echo "Slack notification failed (non-fatal)"
-
-      - name: Auto-remediate safe drift (tag changes only)
-        id: auto_remediate
+      - name: Create or update drift issue
         if: steps.plan.outputs.exit_code == '2'
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: |
-          # Detect whether ALL changes are limited to tag modifications
-          NON_TAG_CHANGES=$(grep -E '^\s+[~+\-]' plan_output.txt \
-            | grep -v '"tags"' \
-            | grep -v '"tags_all"' \
-            | grep -c '.' || true)
-
-          if [ "$NON_TAG_CHANGES" -eq 0 ] && \
-             [ "${{ github.event.inputs.auto_remediate }}" != "false" ]; then
-            echo "All drift is tag-only — applying auto-remediation..."
-
-            # Extract changed resource addresses from the JSON plan
-            if [ -f tfplan.json ]; then
-              RESOURCES=$(jq -r \
-                '.resource_changes[] | select(.change.actions | map(. != "no-op") | any) | .address' \
-                tfplan.json 2>/dev/null | head -20)
-
-              if [ -n "$RESOURCES" ]; then
-                TARGET_ARGS=$(echo "$RESOURCES" | sed 's/^/-target=/' | tr '\n' ' ')
-                terraform apply -auto-approve $TARGET_ARGS \
-                  -var="db_username=${{ secrets.TF_VAR_DB_USERNAME }}" \
-                  -var="ssh_public_key=${{ secrets.TF_VAR_SSH_PUBLIC_KEY }}" \
-                  2>&1 | tee remediation_output.txt
-                echo "remediation_status=auto_remediated" >> "$GITHUB_OUTPUT"
-                echo "✅ Auto-remediation applied (tag changes only)." >> "$GITHUB_STEP_SUMMARY"
-              fi
-            fi
-          else
-            echo "Non-tag drift detected — manual review required."
-            echo "remediation_status=manual_review_required" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Create GitHub issue (manual review required)
-        if: >
-          steps.plan.outputs.exit_code == '2' &&
-          steps.auto_remediate.outputs.remediation_status == 'manual_review_required'
+        uses: actions/github-script@v9
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          REPORT=$(head -c 3000 terraform/drift_report.txt)
-          gh issue create \
-            --title "[Drift] Infrastructure drift detected $(date +%Y-%m-%d)" \
-            --body "## Infrastructure Drift Detected
-
-          **Date:** $(date -u)
-          **Workflow:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-          ## Drift Report
-          \`\`\`
-          ${REPORT}
-          \`\`\`
-
-          ## Action Required
-          Manual review is required. The drift includes changes beyond tag modifications.
-          Please review the plan output and apply or revert as appropriate.
-
-          /cc @${{ github.repository_owner }}" \
-            --label "infrastructure" \
-            --repo "${{ github.repository }}" || echo "Issue creation failed (non-fatal)"
+          ENVIRONMENT: ${{ matrix.environment }}
+        with:
+          script: |
+            const fs = require('fs');
+            const environment = process.env.ENVIRONMENT;
+            const title = `[Terraform drift] ${environment}`;
+            const fullOutput = fs.readFileSync('plan-output.txt', 'utf8');
+            const excerpt = fullOutput.slice(0, 4000);
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = `## Terraform drift detected\n\nEnvironment: \`${environment}\`\nRun: ${runUrl}\n\nThe refresh-only plan output is limited to 4,000 characters. See the workflow artifact for the complete output.\n\n\`\`\`text\n${excerpt}\n\`\`\``;
+            const { data: issues } = await github.rest.issues.listForRepo({
+              ...context.repo,
+              state: 'open',
+              per_page: 100,
+            });
+            const existing = issues.find((issue) => !issue.pull_request && issue.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: existing.number, body });
+            } else {
+              const { data: issue } = await github.rest.issues.create({ ...context.repo, title, body });
+              core.info(`Created drift issue #${issue.number}`);
+            }
+            for (const name of ['infrastructure', 'devops']) {
+              try {
+                await github.rest.issues.createLabel({ ...context.repo, name, color: name === 'devops' ? '1d76db' : 'd4c5f9' });
+              } catch (error) {
+                if (error.status !== 422) throw error;
+              }
+            }
+            const { data: refreshed } = await github.rest.issues.listForRepo({ ...context.repo, state: 'open', per_page: 100 });
+            const issue = refreshed.find((item) => !item.pull_request && item.title === title);
+            if (issue) await github.rest.issues.addLabels({ ...context.repo, issue_number: issue.number, labels: ['infrastructure', 'devops'] });
 
       - name: Notify operations channel
         if: steps.plan.outputs.exit_code == '2'
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          if [[ -z "$SLACK_WEBHOOK_URL" ]]; then
-            echo "SLACK_WEBHOOK_URL is not configured; drift details remain in the workflow summary and GitHub issue."
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "SLACK_WEBHOOK_URL is not configured; the GitHub issue and workflow artifact contain the drift report."
             exit 0
           fi
-          REPORT=$(head -c 3000 terraform/drift_report.txt)
-          PAYLOAD=$(jq -n --arg text "Terraform drift detected in $GITHUB_REPOSITORY. Review $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID.\n\n$REPORT" '{text: $text}')
-          curl --fail --silent --show-error -X POST -H 'Content-Type: application/json' \
-            --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
+          summary="Terraform drift detected in ${{ matrix.environment }}. Review $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          payload=$(jq -n --arg text "$summary" '{text: $text}')
+          curl --fail --silent --show-error -X POST \
+            -H 'Content-Type: application/json' \
+            --data "$payload" "$SLACK_WEBHOOK_URL"
 
-      - name: Fail on Terraform plan error
-        if: steps.plan.outputs.exit_code == '1'
-        run: |
-          echo "❌ Terraform plan returned an error. Check plan_output.txt artifact."
-          exit 1
-
-      - name: Post summary
-        if: always()
-        run: |
-          echo "## 🔍 Infrastructure Drift Detection Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Run time** | $(date -u) |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Trigger** | ${{ github.event_name }} |" >> "$GITHUB_STEP_SUMMARY"
-
-          case "${{ steps.plan.outputs.exit_code }}" in
-            0) echo "| **Status** | ✅ No drift detected |" >> "$GITHUB_STEP_SUMMARY" ;;
-            2) echo "| **Status** | ⚠️ Drift detected — see artifacts |" >> "$GITHUB_STEP_SUMMARY" ;;
-            1) echo "| **Status** | ❌ Terraform plan error |" >> "$GITHUB_STEP_SUMMARY" ;;
-            *) echo "| **Status** | ❓ Unknown |" >> "$GITHUB_STEP_SUMMARY" ;;
-          esac
-
-          if [ -f terraform/drift_report.txt ]; then
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "### Drift Report" >> "$GITHUB_STEP_SUMMARY"
-            echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
-            head -c 3000 terraform/drift_report.txt >> "$GITHUB_STEP_SUMMARY"
-            echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
-          fi
+      - name: Fail on Terraform plan errors
+        if: steps.plan.outputs.exit_code == '1' || steps.plan.outputs.exit_code == ''
+        run: exit 1

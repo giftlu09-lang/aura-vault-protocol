@@ -46,6 +46,10 @@ data:
           - channel: '#critical-alerts'
             title: '[CRITICAL] {{ .CommonAnnotations.summary }}'
             text: '{{ .CommonAnnotations.description }}'
+        pagerduty_configs:
+          - routing_key: '${PAGERDUTY_ROUTING_KEY}'
+            severity: '{{ if eq .CommonLabels.severity "critical" }}critical{{ else }}warning{{ end }}'
+            send_resolved: true
 
       - name: 'warning'
         slack_configs:
@@ -105,6 +109,12 @@ spec:
                 secretKeyRef:
                   name: alertmanager-secrets
                   key: slack_webhook_url
+                  optional: false
+            - name: PAGERDUTY_ROUTING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: alertmanager-secrets
+                  key: pagerduty_routing_key
                   optional: false
           volumeMounts:
             - name: alertmanager-config

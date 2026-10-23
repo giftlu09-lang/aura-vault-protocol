@@ -3,7 +3,7 @@ groups:
     interval: 1m
     rules:
       - alert: AuraRouteErrorRateSpike
-        expr: sum by (route) (count_over_time({service="aura-vault-backend", level=~"error|fatal"} | json | label_format route="{{.req_url}}" [1m])) > 10
+        expr: sum by (route) (count_over_time({service="aura-vault-backend", level=~"error|fatal"} | json route="request.url" | __error__="" | label_format route="{{.route}}" [1m])) > 10
         for: 1m
         labels:
           severity: warning
@@ -13,7 +13,7 @@ groups:
           description: "More than 10 error log lines were emitted for this route in one minute."
 
       - alert: AuraAuthenticationFailureSpike
-        expr: sum(count_over_time({service="aura-vault-backend"} |= "INVALID_TOKEN" [1m])) > 20
+        expr: sum(count_over_time({service="aura-vault-backend"} | json eventCode="eventCode" | eventCode="INVALID_TOKEN" [1m])) > 20
         for: 1m
         labels:
           severity: critical
@@ -23,17 +23,17 @@ groups:
           description: "More than 20 INVALID_TOKEN events were logged in one minute."
 
       - alert: AuraDatabaseConnectionRefused
-        expr: sum(count_over_time({service="aura-vault-backend"} |~ "(?i)(pg|postgres).*(ECONNREFUSED|connection refused)" [1m])) > 0
+        expr: sum(count_over_time({service="aura-vault-backend", level=~"error|fatal"} |~ "(?i)(ECONNREFUSED|connection refused)" [1m])) > 0
         for: 0m
         labels:
           severity: critical
           priority: P1
         annotations:
           summary: "Database connection refused"
-          description: "A backend log reports a refused PostgreSQL connection."
+          description: "A backend error log reports a refused connection; inspect the log context to confirm the dependency."
 
       - alert: AuraHorizonTimeoutSpike
-        expr: sum(count_over_time({service="aura-vault-backend"} |~ "(?i)horizon.*(timeout|timed out)" [5m])) > 5
+        expr: sum(count_over_time({service="aura-vault-backend"} |~ "(?i)horizon.*(timeout|timed out)|(timeout|timed out).*horizon" [5m])) > 5
         for: 1m
         labels:
           severity: warning
@@ -43,7 +43,7 @@ groups:
           description: "More than five Horizon timeout events were logged in five minutes."
 
       - alert: AuraBullMQJobFailureSpike
-        expr: sum(count_over_time({service="aura-vault-backend"} |~ "(?i)(bullmq|job).*(failed|failure)" [1m])) > 5
+        expr: sum(count_over_time({service="aura-vault-backend", level=~"error|fatal"} |~ "(?i)(bullmq|queue|job).*(failed|failure)|(failed|failure).*(bullmq|queue|job)" [1m])) > 5
         for: 1m
         labels:
           severity: warning

@@ -42,7 +42,7 @@ data "terraform_remote_state" "root" {
   backend = "s3"
   config = {
     bucket = "aura-vault-terraform-state"
-    key    = "terraform.tfstate"
+    key    = "infrastructure/terraform.tfstate"
     region = "us-east-1"
   }
 }

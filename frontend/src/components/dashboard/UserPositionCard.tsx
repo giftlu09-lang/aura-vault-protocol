@@ -5,6 +5,7 @@ import { DashboardCard } from "./DashboardCard";
 import { ShareBalanceDisplay } from "@/components/ShareBalanceDisplay";
 import { ExplorerMenu } from "@/components/ExplorerMenu";
 import { useContractEvents } from "@/lib/useContractEvents";
+import { estimateYieldPerSecond } from "@/lib/yieldAccrual";
 
 export interface UserPosition {
   /** Underlying token balance redeemable by this user */
@@ -66,16 +67,17 @@ export function UserPositionCard({ position, isLoading }: UserPositionCardProps)
     return Number.isFinite(value) && value > 0 ? value : 0;
   }, [position?.underlyingBalance]);
   const apy = position?.apy7d;
-  const perSecond = typeof apy === "number" && Number.isFinite(apy) && apy >= 0
-    ? positionValue * apy / (365.25 * 24 * 60 * 60)
-    : 0;
+  const perSecond = estimateYieldPerSecond(position?.underlyingBalance ?? "0", apy);
 
   useEffect(() => {
     if (lastEvent?.type === "harvest") setAccrued(0);
   }, [lastEvent]);
 
   useEffect(() => {
-    if (!position?.lastHarvestAt) return;
+    if (!position?.lastHarvestAt) {
+      setAccrued(0);
+      return;
+    }
     const harvestedAt = typeof position.lastHarvestAt === "number"
       ? position.lastHarvestAt
       : new Date(position.lastHarvestAt).getTime();
